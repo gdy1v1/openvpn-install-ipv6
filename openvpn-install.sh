@@ -277,10 +277,18 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	chown nobody:"$group_name" /etc/openvpn/server/crl.pem
 	# Without +x in the directory, OpenVPN can't run a stat() on the CRL file
 	chmod o+x /etc/openvpn/server/
+	# Prefer IPv6 for the VPN transport while keeping IPv4 connectivity.
+	# On Linux, an IPv6 UDP socket can also accept IPv4-mapped packets.
+	listen_protocol="$protocol"
+	local_bind="local $ip"
+	if [[ "$protocol" == "udp" && -n "$ip6" ]]; then
+		listen_protocol="udp6"
+		local_bind=""
+	fi
 	# Generate server.conf
-	echo "local $ip
+	echo "$local_bind
 port $port
-proto $protocol
+proto $listen_protocol
 dev tun
 ca ca.crt
 cert server.crt
@@ -364,6 +372,11 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 		# Enable without waiting for a reboot or service restart
 		echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
 	fi
+	# IPv4-mapped IPv6 sockets are required for single-port UDP dual-stack.
+	if [[ "$listen_protocol" == "udp6" ]]; then
+		echo 'net.ipv6.bindv6only=0' > /etc/sysctl.d/99-openvpn-ipv6-dualstack.conf
+		sysctl -w net.ipv6.bindv6only=0
+	fi
 	if systemctl is-active --quiet firewalld.service; then
 		# Using both permanent and not permanent rules to avoid a firewalld
 		# reload.
@@ -412,6 +425,11 @@ ExecStart=$ip6tables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -
 ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
 ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
 ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			# Allow OpenVPN's IPv6 transport socket through the IPv6 filter.
+			if [[ "$listen_protocol" == "udp6" ]]; then
+				echo "ExecStart=$ip6tables_path -w 5 -I INPUT -p udp --dport $port -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -D INPUT -p udp --dport $port -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			fi
 		fi
 		echo "RemainAfterExit=yes
 [Install]
@@ -428,11 +446,18 @@ WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 	fi
 	# If the server is behind NAT, use the correct IP address
 	[[ -n "$public_ip" ]] && ip="$public_ip"
-	# client-common.txt is created so we have a template to add further users later
+	# client-common.txt is created so we have a template to add further users later.
+	# Try IPv6 transport first, with IPv4 as a fallback on UDP dual-stack servers.
+	if [[ "$listen_protocol" == "udp6" ]]; then
+		remote_lines="remote $ip6 $port udp6
+remote $ip $port udp4"
+	else
+		remote_lines="remote $ip $port"
+	fi
 	echo "client
 dev tun
 proto $protocol
-remote $ip $port
+$remote_lines
 resolv-retry infinite
 nobind
 persist-key
@@ -535,6 +560,8 @@ else
 			if [[ "$remove" =~ ^[yY]$ ]]; then
 				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
+				# Firewall tools use udp/tcp, not OpenVPN's udp6/tcp6 names.
+				protocol="${protocol%6}"
 				if systemctl is-active --quiet firewalld.service; then
 					ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
@@ -560,7 +587,7 @@ else
 				fi
 				systemctl disable --now openvpn-server@server.service
 				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
-				rm -f /etc/sysctl.d/99-openvpn-forward.conf
+				rm -f /etc/sysctl.d/99-openvpn-forward.conf /etc/sysctl.d/99-openvpn-ipv6-dualstack.conf
 				if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 					rm -rf /etc/openvpn/server
 					apt-get remove --purge -y openvpn
