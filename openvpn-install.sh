@@ -83,6 +83,284 @@ fi
 # Store the absolute path of the directory where the script is located
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+
+# Per-client IPv6 egress mapping. This is separate from the IPv4/IPv6 address
+# used by clients to CONNECT to the VPN server.
+IPV6_MAP_FILE="/etc/openvpn/server/ipv6-client-map.tsv"
+IPV6_NAT_HELPER="/usr/local/sbin/openvpn-client-ipv6-nat"
+IPV6_NAT_SERVICE="openvpn-client-ipv6-nat.service"
+
+vpn_ipv6_network() {
+	local network
+	network=$(awk '$1 == "server-ipv6" { print $2; exit }' /etc/openvpn/server/server.conf)
+	# This installer configures an IPv6 /64 using a compressed :: suffix.
+	if [[ "$network" != *"::/64" ]]; then
+		echo "Per-client IPv6 egress requires server-ipv6 PREFIX::/64 in server.conf." >&2
+		return 1
+	fi
+	VPN_IPV6_NETWORK="$network"
+	VPN_IPV6_PREFIX="${network%::/64}"
+}
+
+# Collect only globally scoped IPv6 addresses on the default IPv6 uplink.
+get_public_ipv6_addresses() {
+	local dev address
+	PUBLIC_IPV6_ADDRESSES=()
+	dev=$(ip -6 route show default | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')
+	[[ -n "$dev" ]] || return 0
+	while IFS= read -r address; do
+		[[ "$address" =~ ^[23][0-9a-fA-F:]+$ ]] && PUBLIC_IPV6_ADDRESSES+=("$address")
+	done < <(ip -6 -o addr show dev "$dev" scope global | awk '{split($4,a,"/"); print a[1]}')
+}
+
+# SELECTED_IPV6 is empty for shared/default egress, otherwise the chosen IP.
+select_client_ipv6_exit() {
+	local client_name="$1" n choice current="" default_choice=0
+	SELECTED_IPV6=""
+	if ! grep -qE '^server-ipv6[[:space:]]' /etc/openvpn/server/server.conf; then
+		echo "IPv6 is not enabled for this OpenVPN server; using IPv4 only."
+		return 0
+	fi
+	get_public_ipv6_addresses
+	if (( ${#PUBLIC_IPV6_ADDRESSES[@]} == 0 )); then
+		echo "No public IPv6 addresses were detected; default egress will be used."
+		return 0
+	fi
+	if [[ -f "$IPV6_MAP_FILE" ]]; then
+		current=$(awk -F '\t' -v name="$client_name" '$1==name {print $3; exit}' "$IPV6_MAP_FILE")
+	fi
+	echo
+	echo "Select the IPv6 EXIT address for client $client_name:"
+	echo "   0) Shared/default IPv6 exit (no dedicated mapping)"
+	for (( n=0; n<${#PUBLIC_IPV6_ADDRESSES[@]}; n++ )); do
+		local count
+		count=0
+		if [[ -f "$IPV6_MAP_FILE" ]]; then
+			count=$(awk -F '\t' -v ipv6="${PUBLIC_IPV6_ADDRESSES[n]}" '$3==ipv6 {n++} END {print n+0}' "$IPV6_MAP_FILE")
+		fi
+		printf '   %d) %s' "$((n+1))" "${PUBLIC_IPV6_ADDRESSES[n]}"
+		(( count > 0 )) && printf ' (%d client(s) assigned)' "$count"
+		[[ "$current" == "${PUBLIC_IPV6_ADDRESSES[n]}" ]] && printf ' [current]'
+		printf '\n'
+		[[ "$current" == "${PUBLIC_IPV6_ADDRESSES[n]}" ]] && default_choice=$((n+1))
+	done
+	while :; do
+		read -r -p "IPv6 exit [$default_choice]: " choice
+		[[ -z "$choice" ]] && choice="$default_choice"
+		if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice <= ${#PUBLIC_IPV6_ADDRESSES[@]} )); then
+			break
+		fi
+		echo "Invalid IPv6 choice."
+	done
+	if (( 10#$choice > 0 )); then
+		SELECTED_IPV6="${PUBLIC_IPV6_ADDRESSES[10#$choice-1]}"
+	fi
+}
+
+# Use CCD to pin the VPN-internal IPv6 so source-based SNAT stays deterministic.
+ensure_ipv6_client_ccd() {
+	local configured
+	CCD_RESTART_REQUIRED=0
+	configured=$(awk '$1=="client-config-dir" {print $2; exit}' /etc/openvpn/server/server.conf)
+	if [[ -n "$configured" ]]; then
+		CCD_DIRECTORY="${configured%\"}"
+		CCD_DIRECTORY="${CCD_DIRECTORY#\"}"
+		if [[ "$CCD_DIRECTORY" != /* ]]; then
+			echo "Existing client-config-dir must be an absolute path: $CCD_DIRECTORY" >&2
+			return 1
+		fi
+	else
+		CCD_DIRECTORY="/etc/openvpn/server/ccd"
+		# Back up server.conf before changing its options.
+		cp -an /etc/openvpn/server/server.conf /etc/openvpn/server/server.conf.pre-ipv6-clients.bak
+		printf '\nclient-config-dir %s\n' "$CCD_DIRECTORY" >> /etc/openvpn/server/server.conf
+		CCD_RESTART_REQUIRED=1
+	fi
+	mkdir -p "$CCD_DIRECTORY"
+	chmod 755 "$CCD_DIRECTORY"
+}
+
+install_ipv6_nat_helper() {
+	# The dedicated chain is consulted before the installer's general SNAT rule.
+	# Rules are reloaded on boot and whenever a client's exit changes.
+	cat > "$IPV6_NAT_HELPER" <<'NAT_HELPER_SCRIPT'
+#!/bin/bash
+set -euo pipefail
+MAP="/etc/openvpn/server/ipv6-client-map.tsv"
+CHAIN="OVPN6_CLIENT_SNAT"
+IP6TABLES=$(command -v ip6tables)
+NET=$(awk '$1 == "server-ipv6" {print $2; exit}' /etc/openvpn/server/server.conf)
+[[ -n "$NET" ]] || exit 1
+case "${1:-apply}" in
+	apply)
+		"$IP6TABLES" -w 5 -t nat -N "$CHAIN" 2>/dev/null || true
+		"$IP6TABLES" -w 5 -t nat -F "$CHAIN"
+		if [[ -f "$MAP" ]]; then
+			while IFS=$'\t' read -r client tunnel_ip public_ip; do
+				[[ -n "$client" && -n "$tunnel_ip" && -n "$public_ip" ]] || continue
+				"$IP6TABLES" -w 5 -t nat -A "$CHAIN" -s "${tunnel_ip}/128" -j SNAT --to-source "$public_ip"
+			done < "$MAP"
+		fi
+		"$IP6TABLES" -w 5 -t nat -C POSTROUTING -s "$NET" ! -d "$NET" -j "$CHAIN" 2>/dev/null || \
+			"$IP6TABLES" -w 5 -t nat -I POSTROUTING 1 -s "$NET" ! -d "$NET" -j "$CHAIN"
+		;;
+	remove)
+		"$IP6TABLES" -w 5 -t nat -D POSTROUTING -s "$NET" ! -d "$NET" -j "$CHAIN" 2>/dev/null || true
+		"$IP6TABLES" -w 5 -t nat -F "$CHAIN" 2>/dev/null || true
+		"$IP6TABLES" -w 5 -t nat -X "$CHAIN" 2>/dev/null || true
+		;;
+	*) echo "Usage: $0 apply|remove" >&2; exit 2 ;;
+esac
+NAT_HELPER_SCRIPT
+	chmod 700 "$IPV6_NAT_HELPER"
+	cat > "/etc/systemd/system/$IPV6_NAT_SERVICE" <<EOF
+[Unit]
+Description=OpenVPN per-client IPv6 SNAT
+Wants=network-online.target
+After=network-online.target openvpn-iptables.service firewalld.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$IPV6_NAT_HELPER apply
+ExecReload=$IPV6_NAT_HELPER apply
+ExecStop=$IPV6_NAT_HELPER remove
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+	systemctl enable --now "$IPV6_NAT_SERVICE" || return 1
+	systemctl reload "$IPV6_NAT_SERVICE"
+}
+
+# A high-address portion of the existing ULA /64 is reserved for managed CCD
+# clients. Regular OpenVPN pool allocations start at the beginning of the /64.
+allocate_client_tunnel_ipv6() {
+	local slot candidate
+	vpn_ipv6_network || return 1
+	for (( slot=1; slot<=4095; slot++ )); do
+		printf -v candidate '%s::ffff:%x' "$VPN_IPV6_PREFIX" "$slot"
+		if [[ ! -f "$IPV6_MAP_FILE" ]] || ! grep -Fq "${candidate}"$'\t' "$IPV6_MAP_FILE"; then
+			CLIENT_TUNNEL_IPV6="$candidate"
+			return 0
+		fi
+	done
+	echo "No free managed VPN IPv6 slots remain." >&2
+	return 1
+}
+
+remove_client_ipv6_mapping() {
+	local name="$1" old_tunnel="" ccd_file="" tmp
+	[[ -f "$IPV6_MAP_FILE" ]] || return 0
+	old_tunnel=$(awk -F '\t' -v name="$name" '$1==name {print $2; exit}' "$IPV6_MAP_FILE")
+	[[ -n "$old_tunnel" ]] || return 0
+	# Only delete the ifconfig-ipv6-push line installed for this client.
+	CCD_DIRECTORY=$(awk '$1=="client-config-dir" {print $2; exit}' /etc/openvpn/server/server.conf)
+	CCD_DIRECTORY="${CCD_DIRECTORY%\"}"
+	CCD_DIRECTORY="${CCD_DIRECTORY#\"}"
+	if [[ "$CCD_DIRECTORY" == /* && -f "$CCD_DIRECTORY/$name" ]]; then
+		ccd_file="$CCD_DIRECTORY/$name"
+		sed -i -E '/^[[:space:]]*ifconfig-ipv6-push[[:space:]]/d' "$ccd_file"
+		[[ ! -s "$ccd_file" ]] && rm -f "$ccd_file"
+	fi
+	tmp=$(mktemp "${IPV6_MAP_FILE}.XXXXXX") || return 1
+	awk -F '\t' -v name="$name" '$1!=name' "$IPV6_MAP_FILE" > "$tmp"
+	chmod 600 "$tmp"
+	mv -f "$tmp" "$IPV6_MAP_FILE"
+	if systemctl is-active --quiet "$IPV6_NAT_SERVICE"; then
+		systemctl reload "$IPV6_NAT_SERVICE" || return 1
+	fi
+}
+
+set_client_ipv6_exit() {
+	local name="$1" public_ip="$2" old_tunnel="" tmp ccd_file
+	if [[ -z "$public_ip" ]]; then
+		remove_client_ipv6_mapping "$name" || return 1
+		echo "Client $name now uses the shared/default IPv6 exit. Reconnect to apply."
+		return 0
+	fi
+	vpn_ipv6_network || return 1
+	# Verify that the chosen address is currently assigned to our uplink.
+	get_public_ipv6_addresses
+	local found=0 item
+	for item in "${PUBLIC_IPV6_ADDRESSES[@]}"; do
+		[[ "$item" == "$public_ip" ]] && found=1
+	done
+	if (( found == 0 )); then
+		echo "IPv6 $public_ip is not assigned to this VPS." >&2
+		return 1
+	fi
+	if [[ -f "$IPV6_MAP_FILE" ]]; then
+		old_tunnel=$(awk -F '\t' -v name="$name" '$1==name {print $2; exit}' "$IPV6_MAP_FILE")
+	fi
+	if [[ -n "$old_tunnel" ]]; then
+		CLIENT_TUNNEL_IPV6="$old_tunnel"
+	else
+		allocate_client_tunnel_ipv6 || return 1
+	fi
+	ensure_ipv6_client_ccd || return 1
+	ccd_file="$CCD_DIRECTORY/$name"
+	if [[ -z "$old_tunnel" && -f "$ccd_file" ]] && grep -qE '^[[:space:]]*ifconfig-ipv6-push[[:space:]]' "$ccd_file"; then
+		echo "Existing unmanaged IPv6 push in $ccd_file; refusing to overwrite." >&2
+		return 1
+	fi
+	if [[ -f "$ccd_file" ]]; then
+		sed -i -E '/^[[:space:]]*ifconfig-ipv6-push[[:space:]]/d' "$ccd_file"
+	fi
+	printf 'ifconfig-ipv6-push %s/64 %s::1\n' "$CLIENT_TUNNEL_IPV6" "$VPN_IPV6_PREFIX" >> "$ccd_file"
+	chmod 644 "$ccd_file"
+	mkdir -p "$(dirname "$IPV6_MAP_FILE")"
+	tmp=$(mktemp "${IPV6_MAP_FILE}.XXXXXX") || return 1
+	if [[ -f "$IPV6_MAP_FILE" ]]; then
+		awk -F '\t' -v name="$name" '$1!=name' "$IPV6_MAP_FILE" > "$tmp"
+	fi
+	printf '%s\t%s\t%s\n' "$name" "$CLIENT_TUNNEL_IPV6" "$public_ip" >> "$tmp"
+	chmod 600 "$tmp"
+	mv -f "$tmp" "$IPV6_MAP_FILE"
+	install_ipv6_nat_helper || return 1
+	if (( CCD_RESTART_REQUIRED )); then
+		echo "Enabling per-client OpenVPN configuration (brief VPN reconnect required)."
+		systemctl restart openvpn-server@server.service || return 1
+	fi
+	echo "IPv6 exit for $name: $public_ip"
+	echo "Reconnect this OpenVPN client to apply the new IPv6 assignment."
+}
+
+list_client_ipv6_exits() {
+	echo
+	echo "Dedicated IPv6 exits (other clients use the shared/default IPv6 exit):"
+	if [[ ! -s "$IPV6_MAP_FILE" ]]; then
+		echo "   None."
+		return
+	fi
+	awk -F '\t' '{printf "   %-20s %-42s (VPN: %s)\n",$1,$3,$2}' "$IPV6_MAP_FILE"
+}
+
+list_valid_clients() {
+	# EasyRSA CN is normalized by this installer when certificates are created.
+	awk -F '\t' '$1 == "V" {sub(/^.*CN=/,"",$NF); print $NF}' /etc/openvpn/server/easy-rsa/pki/index.txt
+}
+
+select_existing_client() {
+	local prompt="$1" choice n
+	mapfile -t VALID_CLIENTS < <(list_valid_clients)
+	if (( ${#VALID_CLIENTS[@]} == 0 )); then
+		echo "There are no valid clients."
+		return 1
+	fi
+	echo "$prompt"
+	for (( n=0; n<${#VALID_CLIENTS[@]}; n++ )); do
+		printf '   %d) %s\n' "$((n+1))" "${VALID_CLIENTS[n]}"
+	done
+	while :; do
+		read -r -p "Client: " choice
+		if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( 10#$choice <= ${#VALID_CLIENTS[@]} )); then
+			SELECTED_CLIENT="${VALID_CLIENTS[10#$choice-1]}"
+			return 0
+		fi
+		echo "Invalid client selection."
+	done
+}
+
 if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	# Detect some Debian minimal setups where neither wget nor curl are installed
 	if ! hash wget 2>/dev/null && ! hash curl 2>/dev/null; then
@@ -475,6 +753,12 @@ verb 3" > /etc/openvpn/server/client-common.txt
 	echo
 	echo "The client configuration is available in:" "$script_dir"/"$client.ovpn"
 	echo "New clients can be added by running this script again."
+	if grep -qE '^server-ipv6[[:space:]]' /etc/openvpn/server/server.conf; then
+		select_client_ipv6_exit "$client"
+		if [[ -n "$SELECTED_IPV6" ]]; then
+			set_client_ipv6_exit "$client" "$SELECTED_IPV6" || echo "WARNING: Unable to configure the dedicated IPv6 exit."
+		fi
+	fi
 else
 	clear
 	echo "OpenVPN is already installed."
@@ -483,9 +767,11 @@ else
 	echo "   1) Add a new client"
 	echo "   2) Revoke an existing client"
 	echo "   3) Remove OpenVPN"
-	echo "   4) Exit"
+	echo "   4) Change an existing client's IPv6 exit"
+	echo "   5) Show dedicated IPv6 exits"
+	echo "   6) Exit"
 	read -p "Option: " option
-	until [[ "$option" =~ ^[1-4]$ ]]; do
+	until [[ "$option" =~ ^[1-6]$ ]]; do
 		echo "$option: invalid selection."
 		read -p "Option: " option
 	done
@@ -500,12 +786,16 @@ else
 				read -p "Name: " unsanitized_client
 				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 			done
+			select_client_ipv6_exit "$client"
 			cd /etc/openvpn/server/easy-rsa/
 			./easyrsa --batch --days=3650 build-client-full "$client" nopass
 			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 			echo
 			echo "$client added. Configuration available in:" "$script_dir"/"$client.ovpn"
+			if [[ -n "$SELECTED_IPV6" ]]; then
+				set_client_ipv6_exit "$client" "$SELECTED_IPV6" || echo "WARNING: Dedicated IPv6 exit setup failed; client certificate remains valid."
+			fi
 			exit
 		;;
 		2)
@@ -536,6 +826,7 @@ else
 				cd /etc/openvpn/server/easy-rsa/
 				./easyrsa --batch revoke "$client"
 				./easyrsa --batch --days=3650 gen-crl
+				remove_client_ipv6_mapping "$client" || echo "WARNING: IPv6 mapping cleanup failed."
 				rm -f /etc/openvpn/server/crl.pem
 				rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
 				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
@@ -558,6 +849,11 @@ else
 				read -p "Confirm OpenVPN removal? [y/N]: " remove
 			done
 			if [[ "$remove" =~ ^[yY]$ ]]; then
+				if [[ -f "/etc/systemd/system/$IPV6_NAT_SERVICE" ]]; then
+					systemctl disable --now "$IPV6_NAT_SERVICE"
+					rm -f "/etc/systemd/system/$IPV6_NAT_SERVICE" "$IPV6_NAT_HELPER"
+					systemctl daemon-reload
+				fi
 				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				# Firewall tools use udp/tcp, not OpenVPN's udp6/tcp6 names.
@@ -605,6 +901,27 @@ else
 			exit
 		;;
 		4)
+			echo
+			select_existing_client "Select a client whose IPv6 exit should change:" || exit
+			client="$SELECTED_CLIENT"
+			if ! grep -qE '^server-ipv6[[:space:]]' /etc/openvpn/server/server.conf; then
+				echo "IPv6 is not enabled on this OpenVPN server."
+				exit 1
+			fi
+			get_public_ipv6_addresses
+			if (( ${#PUBLIC_IPV6_ADDRESSES[@]} == 0 )); then
+				echo "No assigned public IPv6 addresses were detected."
+				exit 1
+			fi
+			select_client_ipv6_exit "$client"
+			set_client_ipv6_exit "$client" "$SELECTED_IPV6" || exit 1
+			exit
+		;;
+		5)
+			list_client_ipv6_exits
+			exit
+		;;
+		6)
 			exit
 		;;
 	esac
